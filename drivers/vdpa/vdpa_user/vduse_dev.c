@@ -57,6 +57,7 @@ struct vduse_virtqueue {
 	struct vdpa_callback cb;
 	struct work_struct inject;
 	struct work_struct kick;
+	int irq_affinity;
 };
 
 struct vduse_dev;
@@ -128,6 +129,7 @@ static struct class *vduse_class;
 static struct cdev vduse_ctrl_cdev;
 static struct cdev vduse_cdev;
 static struct workqueue_struct *vduse_irq_wq;
+static struct workqueue_struct *vduse_irq_bound_wq;
 
 static u32 allowed_device_id[] = {
 	VIRTIO_ID_BLOCK,
@@ -912,7 +914,8 @@ static void vduse_vq_irq_inject(struct work_struct *work)
 }
 
 static int vduse_dev_queue_irq_work(struct vduse_dev *dev,
-				    struct work_struct *irq_work)
+				    struct work_struct *irq_work,
+				    int irq_affinity)
 {
 	int ret = -EINVAL;
 
@@ -921,7 +924,11 @@ static int vduse_dev_queue_irq_work(struct vduse_dev *dev,
 		goto unlock;
 
 	ret = 0;
-	queue_work(vduse_irq_wq, irq_work);
+	if (irq_affinity == -1)
+		queue_work(vduse_irq_wq, irq_work);
+	else
+		queue_work_on(irq_affinity,
+			      vduse_irq_bound_wq, irq_work);
 unlock:
 	up_read(&dev->rwsem);
 
@@ -1106,7 +1113,7 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 		break;
 	}
 	case VDUSE_DEV_INJECT_CONFIG_IRQ:
-		ret = vduse_dev_queue_irq_work(dev, &dev->inject);
+		ret = vduse_dev_queue_irq_work(dev, &dev->inject, -1);
 		break;
 	case VDUSE_VQ_SETUP: {
 		struct vduse_vq_config config;
@@ -1193,7 +1200,8 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 			break;
 
 		index = array_index_nospec(index, dev->vq_num);
-		ret = vduse_dev_queue_irq_work(dev, &dev->vqs[index]->inject);
+		ret = vduse_dev_queue_irq_work(dev, &dev->vqs[index]->inject,
+					       dev->vqs[index]->irq_affinity);
 		break;
 	}
 	case VDUSE_IOTLB_REG_UMEM: {
@@ -1362,6 +1370,7 @@ static int vduse_dev_init_vqs(struct vduse_dev *dev, u32 vq_align, u32 vq_num)
 			goto err;
 
 		dev->vqs[i]->index = i;
+		dev->vqs[i]->irq_affinity = -1;
 		INIT_WORK(&dev->vqs[i]->inject, vduse_vq_irq_inject);
 		INIT_WORK(&dev->vqs[i]->kick, vduse_vq_kick_work);
 		spin_lock_init(&dev->vqs[i]->kick_lock);
@@ -1850,12 +1859,15 @@ static int vduse_init(void)
 	if (ret)
 		goto err_cdev;
 
+	ret = -ENOMEM;
 	vduse_irq_wq = alloc_workqueue("vduse-irq",
 				WQ_HIGHPRI | WQ_SYSFS | WQ_UNBOUND, 0);
-	if (!vduse_irq_wq) {
-		ret = -ENOMEM;
+	if (!vduse_irq_wq)
 		goto err_wq;
-	}
+
+	vduse_irq_bound_wq = alloc_workqueue("vduse-irq-bound", WQ_HIGHPRI, 0);
+	if (!vduse_irq_bound_wq)
+		goto err_bound_wq;
 
 	ret = vduse_domain_init();
 	if (ret)
@@ -1869,6 +1881,8 @@ static int vduse_init(void)
 err_mgmtdev:
 	vduse_domain_exit();
 err_domain:
+	destroy_workqueue(vduse_irq_bound_wq);
+err_bound_wq:
 	destroy_workqueue(vduse_irq_wq);
 err_wq:
 	cdev_del(&vduse_cdev);
@@ -1888,6 +1902,7 @@ static void vduse_exit(void)
 {
 	vduse_mgmtdev_exit();
 	vduse_domain_exit();
+	destroy_workqueue(vduse_irq_bound_wq);
 	destroy_workqueue(vduse_irq_wq);
 	cdev_del(&vduse_cdev);
 	device_destroy(vduse_class, vduse_major);
