@@ -59,6 +59,7 @@ struct vduse_virtqueue {
 	struct work_struct kick;
 	struct kobject kobj;
 	int irq_affinity;
+	bool enable_irq_wq;
 };
 
 struct vduse_dev;
@@ -936,6 +937,26 @@ unlock:
 	return ret;
 }
 
+static int vduse_dev_inject_vq_irq(struct vduse_dev *dev,
+				   struct vduse_virtqueue *vq)
+{
+	int ret = -EINVAL;
+
+	down_read(&dev->rwsem);
+	if (!(dev->status & VIRTIO_CONFIG_S_DRIVER_OK))
+		goto unlock;
+
+	ret = 0;
+	spin_lock_irq(&vq->irq_lock);
+	if (vq->ready && vq->cb.callback)
+		vq->cb.callback(vq->cb.private);
+	spin_unlock_irq(&vq->irq_lock);
+unlock:
+	up_read(&dev->rwsem);
+
+	return ret;
+}
+
 static int vduse_dev_dereg_umem(struct vduse_dev *dev,
 				u64 iova, u64 size)
 {
@@ -1201,8 +1222,12 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 			break;
 
 		index = array_index_nospec(index, dev->vq_num);
-		ret = vduse_dev_queue_irq_work(dev, &dev->vqs[index]->inject,
-					       dev->vqs[index]->irq_affinity);
+		if (dev->vqs[index]->enable_irq_wq)
+			ret = vduse_dev_queue_irq_work(dev,
+					&dev->vqs[index]->inject,
+					dev->vqs[index]->irq_affinity);
+		else
+			ret = vduse_dev_inject_vq_irq(dev, dev->vqs[index]);
 		break;
 	}
 	case VDUSE_IOTLB_REG_UMEM: {
@@ -1343,6 +1368,26 @@ static const struct file_operations vduse_dev_fops = {
 	.llseek		= noop_llseek,
 };
 
+static ssize_t enable_irq_wq_show(struct vduse_virtqueue *vq, char *buf)
+{
+	return sprintf(buf, "%d\n", vq->enable_irq_wq);
+}
+
+static ssize_t enable_irq_wq_store(struct vduse_virtqueue *vq,
+				const char *buf, size_t count)
+{
+	bool enabled;
+	int ret;
+
+	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+
+	vq->enable_irq_wq = enabled;
+
+	return count;
+}
+
 static ssize_t irq_affinity_show(struct vduse_virtqueue *vq, char *buf)
 {
 	return sprintf(buf, "%d\n", vq->irq_affinity);
@@ -1372,8 +1417,11 @@ struct vq_sysfs_entry {
 
 static struct vq_sysfs_entry irq_affinity_attr = __ATTR_RW(irq_affinity);
 
+static struct vq_sysfs_entry enable_irq_wq_attr = __ATTR_RW(enable_irq_wq);
+
 static struct attribute *vq_attrs[] = {
 	&irq_affinity_attr.attr,
+	&enable_irq_wq_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(vq);
@@ -1455,6 +1503,7 @@ static int vduse_dev_init_vqs(struct vduse_dev *dev, u32 vq_align, u32 vq_num)
 
 		dev->vqs[i]->index = i;
 		dev->vqs[i]->irq_affinity = -1;
+		dev->vqs[i]->enable_irq_wq = true;
 		INIT_WORK(&dev->vqs[i]->inject, vduse_vq_irq_inject);
 		INIT_WORK(&dev->vqs[i]->kick, vduse_vq_kick_work);
 		spin_lock_init(&dev->vqs[i]->kick_lock);
