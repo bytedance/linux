@@ -115,6 +115,208 @@ void vduse_domain_clear_map(struct vduse_iova_domain *domain,
 	spin_unlock(&domain->iotlb.lock);
 }
 
+static int dir_to_perm(enum dma_data_direction dir)
+{
+	int perm = -EFAULT;
+
+	switch (dir) {
+	case DMA_FROM_DEVICE:
+		perm = VHOST_MAP_WO;
+		break;
+	case DMA_TO_DEVICE:
+		perm = VHOST_MAP_RO;
+		break;
+	case DMA_BIDIRECTIONAL:
+		perm = VHOST_MAP_RW;
+		break;
+	default:
+		WARN_ON(1);
+		break;
+	}
+
+	return perm;
+}
+
+void vduse_domain_reset_zc_map(struct vduse_iova_domain *domain)
+{
+	if (!domain->zc_map)
+		return;
+
+	spin_lock(&domain->iotlb.lock);
+	if (!domain->zc_map)
+		goto unlock;
+
+	vduse_iotlb_del_range(&domain->iotlb, 1ULL << MAX_PHYSMEM_BITS,
+			      ULLONG_MAX);
+	domain->zc_map = 0;
+unlock:
+	spin_unlock(&domain->iotlb.lock);
+}
+
+bool vduse_domain_is_zc_map(struct vduse_iova_domain *domain,
+			    struct vhost_iotlb_map *map)
+{
+	if (!domain->zc_map)
+	       return false;
+
+	if (map->start < 1ULL << MAX_PHYSMEM_BITS)
+		return false;
+
+	return true;
+}
+
+static int vduse_domain_init_zc_map(struct vduse_iova_domain *domain)
+{
+	int ret = 0;
+
+	if (domain->zc_map)
+		return 0;
+
+	spin_lock(&domain->iotlb.lock);
+	if (domain->zc_map)
+		goto unlock;
+
+	ret = vduse_iotlb_add_range(&domain->iotlb, 1ULL << MAX_PHYSMEM_BITS,
+				    ULLONG_MAX, 0, VHOST_MAP_RW,
+				    domain->file, 0);
+	if (ret)
+		goto unlock;
+
+	domain->zc_map = 1;
+unlock:
+	spin_unlock(&domain->iotlb.lock);
+	return ret;
+}
+
+static dma_addr_t vduse_domain_map_page_zc(struct vduse_iova_domain *domain,
+					   struct page *page,
+					   unsigned long offset,
+					   size_t size,
+					   enum dma_data_direction dir,
+					   unsigned long attrs)
+{
+	phys_addr_t pa = page_to_phys(page) + offset;
+	u64 va = pa | (1ULL << MAX_PHYSMEM_BITS);
+	struct vduse_domain_iotlb *iotlb = &domain->iotlb_zc;
+	atomic_t *inuse;
+
+	if (vduse_domain_init_zc_map(domain))
+		return DMA_MAPPING_ERROR;
+
+	inuse = kmalloc(sizeof(atomic_t), GFP_ATOMIC);
+	if (!inuse)
+		return DMA_MAPPING_ERROR;
+
+	atomic_set(inuse, 0);
+
+	spin_lock(&iotlb->lock);
+	if (vhost_iotlb_add_range_ctx(iotlb->root, pa, pa + size - 1, va,
+				      dir_to_perm(dir), inuse)) {
+		spin_unlock(&iotlb->lock);
+		return DMA_MAPPING_ERROR;
+	}
+	spin_unlock(&iotlb->lock);
+
+	return va;
+}
+
+static void vduse_domain_unmap_page_zc(struct vduse_iova_domain *domain,
+				       dma_addr_t dma_addr, size_t size,
+				       enum dma_data_direction dir,
+				       unsigned long attrs)
+{
+	u64 pa = dma_addr & PHYS_ADDR_MASK;
+	struct vduse_domain_iotlb *iotlb = &domain->iotlb_zc;
+	struct vhost_iotlb_map *map;
+	atomic_t *inuse;
+
+	spin_lock(&iotlb->lock);
+	map = vhost_iotlb_itree_first(iotlb->root, pa, pa + size - 1);
+	if (WARN_ON(!map)) {
+		spin_unlock(&iotlb->lock);
+		return;
+	}
+	vhost_iotlb_map_remove(iotlb->root, map);
+	inuse = (atomic_t *)map->opaque;
+	spin_unlock(&iotlb->lock);
+
+	while (atomic_read(inuse) != 0)
+		cpu_relax();
+	kfree(map);
+	kfree(inuse);
+}
+
+static ssize_t vduse_domain_rw_page_zc(struct vduse_iova_domain *domain,
+				       dma_addr_t dma_addr, bool write,
+				       struct iov_iter *iter)
+{
+	u64 pa = dma_addr & PHYS_ADDR_MASK;
+	struct vduse_domain_iotlb *iotlb = &domain->iotlb_zc;
+	size_t size = iov_iter_count(iter), total_len = 0;
+	atomic_t *inuse = NULL;
+	size_t offset;
+	struct page *page;
+	struct vhost_iotlb_map *map;
+	void *addr;
+	ssize_t ret;
+
+	spin_lock(&iotlb->lock);
+	while ((map = vhost_iotlb_itree_first(iotlb->root,
+					      pa, pa + size -1))) {
+		if (pa < map->start || pa + size - 1 > map->last ||
+		    (write && map->perm == VHOST_MAP_RO) ||
+		    (!write && map->perm == VHOST_MAP_WO))
+			continue;
+
+		inuse = (atomic_t *)map->opaque;
+		atomic_inc(inuse);
+		break;
+	}
+	spin_unlock(&iotlb->lock);
+	if (!inuse)
+		return -EINVAL;
+
+	while (iov_iter_count(iter)) {
+		page = pfn_to_page(PFN_DOWN(pa));
+		offset = offset_in_page(pa);
+		size = min_t(size_t, PAGE_SIZE - offset, iov_iter_count(iter));
+		addr = kmap_local_page(page);
+		if (write)
+			ret = copy_from_iter(addr + offset, size, iter);
+		else
+			ret = copy_to_iter(addr + offset, size, iter);
+
+		kunmap_local(addr);
+		if (ret != size) {
+			total_len = -EFAULT;
+			break;
+		}
+		pa += size;
+		total_len += size;
+	}
+	atomic_dec(inuse);
+
+	return total_len;
+}
+
+static ssize_t vduse_domain_write_iter(struct kiocb *iocb,
+				       struct iov_iter *from)
+{
+	struct file *file = iocb->ki_filp;
+	struct vduse_iova_domain *domain = file->private_data;
+
+	return vduse_domain_rw_page_zc(domain, iocb->ki_pos, true, from);
+}
+
+static ssize_t vduse_domain_read_iter(struct kiocb *iocb,
+				      struct iov_iter *to)
+{
+	struct file *file = iocb->ki_filp;
+	struct vduse_iova_domain *domain = file->private_data;
+
+	return vduse_domain_rw_page_zc(domain, iocb->ki_pos, false, to);
+}
+
 static int vduse_domain_map_bounce_page(struct vduse_iova_domain *domain,
 					 u64 iova, u64 size, u64 paddr)
 {
@@ -401,10 +603,11 @@ static void vduse_domain_free_iova(struct iova_domain *iovad,
 	free_iova_fast(iovad, iova >> shift, iova_len);
 }
 
-dma_addr_t vduse_domain_map_page(struct vduse_iova_domain *domain,
-				 struct page *page, unsigned long offset,
-				 size_t size, enum dma_data_direction dir,
-				 unsigned long attrs)
+static dma_addr_t
+vduse_domain_map_page_bounce(struct vduse_iova_domain *domain,
+			     struct page *page, unsigned long offset,
+			     size_t size, enum dma_data_direction dir,
+			     unsigned long attrs)
 {
 	struct iova_domain *iovad = &domain->stream_iovad;
 	unsigned long limit = domain->bounce_size - 1;
@@ -434,9 +637,11 @@ err:
 	return DMA_MAPPING_ERROR;
 }
 
-void vduse_domain_unmap_page(struct vduse_iova_domain *domain,
-			     dma_addr_t dma_addr, size_t size,
-			     enum dma_data_direction dir, unsigned long attrs)
+static void
+vduse_domain_unmap_page_bounce(struct vduse_iova_domain *domain,
+			       dma_addr_t dma_addr, size_t size,
+			       enum dma_data_direction dir,
+			       unsigned long attrs)
 {
 	struct iova_domain *iovad = &domain->stream_iovad;
 
@@ -447,6 +652,32 @@ void vduse_domain_unmap_page(struct vduse_iova_domain *domain,
 	vduse_domain_unmap_bounce_page(domain, (u64)dma_addr, (u64)size);
 	read_unlock(&domain->bounce_lock);
 	vduse_domain_free_iova(iovad, dma_addr, size);
+}
+
+dma_addr_t vduse_domain_map_page(struct vduse_iova_domain *domain,
+				 struct page *page, unsigned long offset,
+				 size_t size, enum dma_data_direction dir,
+				 unsigned long attrs)
+{
+	if (domain->enable_zc)
+		return vduse_domain_map_page_zc(domain, page, offset,
+						size, dir, attrs);
+
+	return vduse_domain_map_page_bounce(domain, page, offset,
+					    size, dir, attrs);
+}
+
+void vduse_domain_unmap_page(struct vduse_iova_domain *domain,
+			     dma_addr_t dma_addr, size_t size,
+			     enum dma_data_direction dir,
+			     unsigned long attrs)
+{
+	if (domain->enable_zc)
+		return vduse_domain_unmap_page_zc(domain, dma_addr,
+						  size, dir, attrs);
+
+	return vduse_domain_unmap_page_bounce(domain, dma_addr,
+					      size, dir, attrs);
 }
 
 void *vduse_domain_alloc_coherent(struct vduse_iova_domain *domain,
@@ -569,6 +800,8 @@ static int vduse_domain_release(struct inode *inode, struct file *file)
 static const struct file_operations vduse_domain_fops = {
 	.owner = THIS_MODULE,
 	.mmap = vduse_domain_mmap,
+	.read_iter = vduse_domain_read_iter,
+	.write_iter = vduse_domain_write_iter,
 	.release = vduse_domain_release,
 };
 
@@ -578,13 +811,17 @@ void vduse_domain_destroy(struct vduse_iova_domain *domain)
 }
 
 struct vduse_iova_domain *
-vduse_domain_create(unsigned long iova_limit, size_t bounce_size)
+vduse_domain_create(unsigned long iova_limit, size_t bounce_size,
+		    bool enable_zc)
 {
 	struct vduse_iova_domain *domain;
 	struct file *file;
 	struct vduse_bounce_map *map;
 	unsigned long pfn, bounce_pfns;
 	int ret;
+
+	if (enable_zc && MAX_PHYSMEM_BITS >= BITS_PER_TYPE(dma_addr_t))
+		return NULL;
 
 	bounce_pfns = PAGE_ALIGN(bounce_size) >> PAGE_SHIFT;
 	if (iova_limit <= bounce_size)
@@ -597,6 +834,10 @@ vduse_domain_create(unsigned long iova_limit, size_t bounce_size)
 	if (vduse_iotlb_init(&domain->iotlb))
 		goto err_iotlb;
 
+	if (enable_zc && vduse_iotlb_init(&domain->iotlb_zc))
+		goto err_iotlb_zc;
+
+	domain->enable_zc = enable_zc;
 	domain->iova_limit = iova_limit;
 	domain->bounce_size = PAGE_ALIGN(bounce_size);
 	domain->bounce_maps = vzalloc(bounce_pfns *
@@ -613,6 +854,7 @@ vduse_domain_create(unsigned long iova_limit, size_t bounce_size)
 	if (IS_ERR(file))
 		goto err_file;
 
+	file->f_mode |= (FMODE_PREAD | FMODE_PWRITE);
 	domain->file = file;
 	rwlock_init(&domain->bounce_lock);
 	init_iova_domain(&domain->stream_iovad,
@@ -634,6 +876,8 @@ err_iovad_stream:
 err_file:
 	vfree(domain->bounce_maps);
 err_map:
+	vduse_iotlb_deinit(&domain->iotlb_zc);
+err_iotlb_zc:
 	vduse_iotlb_deinit(&domain->iotlb);
 err_iotlb:
 	kfree(domain);

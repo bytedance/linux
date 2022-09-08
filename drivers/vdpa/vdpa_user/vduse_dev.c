@@ -1688,7 +1688,7 @@ static int vduse_create_dev(struct vduse_dev_config *config,
 		goto err_str;
 
 	dev->domain = vduse_domain_create(VDUSE_IOVA_SIZE - 1,
-					  VDUSE_BOUNCE_SIZE);
+					  VDUSE_BOUNCE_SIZE, false);
 	if (!dev->domain)
 		goto err_domain;
 

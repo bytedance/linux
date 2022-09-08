@@ -20,6 +20,8 @@
 
 #define INVALID_PHYS_ADDR (~(phys_addr_t)0)
 
+#define PHYS_ADDR_MASK ((1ULL << MAX_PHYSMEM_BITS) - 1)
+
 struct vduse_domain_iotlb {
 	struct vhost_iotlb *root;
 	spinlock_t lock;
@@ -37,9 +39,12 @@ struct vduse_iova_domain {
 	size_t bounce_size;
 	unsigned long iova_limit;
 	int bounce_map;
+	int zc_map;
 	struct vduse_domain_iotlb iotlb;
+	struct vduse_domain_iotlb iotlb_zc;
 	struct file *file;
 	bool user_bounce_pages;
+	bool enable_zc;
 	rwlock_t bounce_lock;
 };
 
@@ -71,6 +76,11 @@ bool vduse_domain_is_bounce_map(struct vduse_iova_domain *domain,
 
 void vduse_domain_reset_bounce_map(struct vduse_iova_domain *domain);
 
+bool vduse_domain_is_zc_map(struct vduse_iova_domain *domain,
+			    struct vhost_iotlb_map *map);
+
+void vduse_domain_reset_zc_map(struct vduse_iova_domain *domain);
+
 int vduse_domain_add_user_bounce_pages(struct vduse_iova_domain *domain,
 				       struct page **pages, int count);
 
@@ -79,7 +89,8 @@ void vduse_domain_remove_user_bounce_pages(struct vduse_iova_domain *domain);
 void vduse_domain_destroy(struct vduse_iova_domain *domain);
 
 struct vduse_iova_domain *vduse_domain_create(unsigned long iova_limit,
-					      size_t bounce_size);
+					      size_t bounce_size,
+					      bool enable_zc);
 
 int vduse_domain_init(void);
 
