@@ -1286,8 +1286,7 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 			info.start = map->start;
 			info.last = map->last;
 			info.capability = 0;
-			if (domain->bounce_map && map->start == 0 &&
-			    map->last == domain->bounce_size - 1)
+			if (vduse_domain_is_bounce_map(domain, map))
 				info.capability |= VDUSE_IOVA_CAP_UMEM;
 		}
 		spin_unlock(&domain->iotlb.lock);

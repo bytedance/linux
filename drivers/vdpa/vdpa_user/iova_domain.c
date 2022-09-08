@@ -344,6 +344,19 @@ unlock:
 	spin_unlock(&domain->iotlb.lock);
 }
 
+bool vduse_domain_is_bounce_map(struct vduse_iova_domain *domain,
+				struct vhost_iotlb_map *map)
+{
+	if (!domain->bounce_map)
+	       return false;
+
+	if (map->start != 0 ||
+	    map->last != domain->bounce_size - 1)
+		return false;
+
+	return true;
+}
+
 static int vduse_domain_init_bounce_map(struct vduse_iova_domain *domain)
 {
 	int ret = 0;

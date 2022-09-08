@@ -66,6 +66,9 @@ void vduse_domain_free_coherent(struct vduse_iova_domain *domain, size_t size,
 				void *vaddr, dma_addr_t dma_addr,
 				unsigned long attrs);
 
+bool vduse_domain_is_bounce_map(struct vduse_iova_domain *domain,
+				struct vhost_iotlb_map *map);
+
 void vduse_domain_reset_bounce_map(struct vduse_iova_domain *domain);
 
 int vduse_domain_add_user_bounce_pages(struct vduse_iova_domain *domain,
