@@ -36,6 +36,20 @@ void vhost_iotlb_map_free(struct vhost_iotlb *iotlb,
 EXPORT_SYMBOL_GPL(vhost_iotlb_map_free);
 
 /**
+ * vhost_iotlb_map_remove - remove a map node
+ * @iotlb: the IOTLB
+ * @map: the map that want to be remove
+ */
+void vhost_iotlb_map_remove(struct vhost_iotlb *iotlb,
+			  struct vhost_iotlb_map *map)
+{
+	vhost_iotlb_itree_remove(map, &iotlb->root);
+	list_del(&map->link);
+	iotlb->nmaps--;
+}
+EXPORT_SYMBOL_GPL(vhost_iotlb_map_remove);
+
+/**
  * vhost_iotlb_add_range_ctx - add a new range to vhost IOTLB
  * @iotlb: the IOTLB
  * @start: start of the IOVA range

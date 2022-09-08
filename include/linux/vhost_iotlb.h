@@ -49,4 +49,6 @@ vhost_iotlb_itree_next(struct vhost_iotlb_map *map, u64 start, u64 last);
 
 void vhost_iotlb_map_free(struct vhost_iotlb *iotlb,
 			  struct vhost_iotlb_map *map);
+void vhost_iotlb_map_remove(struct vhost_iotlb *iotlb,
+			    struct vhost_iotlb_map *map);
 #endif
