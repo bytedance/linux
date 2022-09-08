@@ -17,7 +17,7 @@
 
 #include "iova_domain.h"
 
-static int vduse_iotlb_add_range(struct vduse_iova_domain *domain,
+static int vduse_iotlb_add_range(struct vduse_domain_iotlb *iotlb,
 				 u64 start, u64 last,
 				 u64 addr, unsigned int perm,
 				 struct file *file, u64 offset)
@@ -32,7 +32,7 @@ static int vduse_iotlb_add_range(struct vduse_iova_domain *domain,
 	map_file->file = get_file(file);
 	map_file->offset = offset;
 
-	ret = vhost_iotlb_add_range_ctx(domain->iotlb, start, last,
+	ret = vhost_iotlb_add_range_ctx(iotlb->root, start, last,
 					addr, perm, map_file);
 	if (ret) {
 		fput(map_file->file);
@@ -42,18 +42,33 @@ static int vduse_iotlb_add_range(struct vduse_iova_domain *domain,
 	return 0;
 }
 
-static void vduse_iotlb_del_range(struct vduse_iova_domain *domain,
+static void vduse_iotlb_del_range(struct vduse_domain_iotlb *iotlb,
 				  u64 start, u64 last)
 {
 	struct vdpa_map_file *map_file;
 	struct vhost_iotlb_map *map;
 
-	while ((map = vhost_iotlb_itree_first(domain->iotlb, start, last))) {
+	while ((map = vhost_iotlb_itree_first(iotlb->root, start, last))) {
 		map_file = (struct vdpa_map_file *)map->opaque;
 		fput(map_file->file);
 		kfree(map_file);
-		vhost_iotlb_map_free(domain->iotlb, map);
+		vhost_iotlb_map_free(iotlb->root, map);
 	}
+}
+
+static void vduse_iotlb_deinit(struct vduse_domain_iotlb *iotlb)
+{
+	vhost_iotlb_free(iotlb->root);
+}
+
+static int vduse_iotlb_init(struct vduse_domain_iotlb *iotlb)
+{
+	iotlb->root = vhost_iotlb_alloc(0, 0);
+	if (!iotlb->root)
+		return -ENOMEM;
+
+	spin_lock_init(&iotlb->lock);
+	return 0;
 }
 
 int vduse_domain_set_map(struct vduse_iova_domain *domain,
@@ -64,25 +79,25 @@ int vduse_domain_set_map(struct vduse_iova_domain *domain,
 	u64 start = 0ULL, last = ULLONG_MAX;
 	int ret;
 
-	spin_lock(&domain->iotlb_lock);
-	vduse_iotlb_del_range(domain, start, last);
+	spin_lock(&domain->iotlb.lock);
+	vduse_iotlb_del_range(&domain->iotlb, start, last);
 
 	for (map = vhost_iotlb_itree_first(iotlb, start, last); map;
 	     map = vhost_iotlb_itree_next(map, start, last)) {
 		map_file = (struct vdpa_map_file *)map->opaque;
-		ret = vduse_iotlb_add_range(domain, map->start, map->last,
-					    map->addr, map->perm,
-					    map_file->file,
+		ret = vduse_iotlb_add_range(&domain->iotlb, map->start,
+					    map->last, map->addr,
+					    map->perm, map_file->file,
 					    map_file->offset);
 		if (ret)
 			goto err;
 	}
-	spin_unlock(&domain->iotlb_lock);
+	spin_unlock(&domain->iotlb.lock);
 
 	return 0;
 err:
-	vduse_iotlb_del_range(domain, start, last);
-	spin_unlock(&domain->iotlb_lock);
+	vduse_iotlb_del_range(&domain->iotlb, start, last);
+	spin_unlock(&domain->iotlb.lock);
 	return ret;
 }
 
@@ -92,12 +107,12 @@ void vduse_domain_clear_map(struct vduse_iova_domain *domain,
 	struct vhost_iotlb_map *map;
 	u64 start = 0ULL, last = ULLONG_MAX;
 
-	spin_lock(&domain->iotlb_lock);
+	spin_lock(&domain->iotlb.lock);
 	for (map = vhost_iotlb_itree_first(iotlb, start, last); map;
 	     map = vhost_iotlb_itree_next(map, start, last)) {
-		vduse_iotlb_del_range(domain, map->start, map->last);
+		vduse_iotlb_del_range(&domain->iotlb, map->start, map->last);
 	}
-	spin_unlock(&domain->iotlb_lock);
+	spin_unlock(&domain->iotlb.lock);
 }
 
 static int vduse_domain_map_bounce_page(struct vduse_iova_domain *domain,
@@ -194,15 +209,15 @@ vduse_domain_get_coherent_page(struct vduse_iova_domain *domain, u64 iova)
 	struct vhost_iotlb_map *map;
 	struct page *page = NULL;
 
-	spin_lock(&domain->iotlb_lock);
-	map = vhost_iotlb_itree_first(domain->iotlb, start, last);
+	spin_lock(&domain->iotlb.lock);
+	map = vhost_iotlb_itree_first(domain->iotlb.root, start, last);
 	if (!map)
 		goto out;
 
 	page = pfn_to_page((map->addr + iova - map->start) >> PAGE_SHIFT);
 	get_page(page);
 out:
-	spin_unlock(&domain->iotlb_lock);
+	spin_unlock(&domain->iotlb.lock);
 
 	return page;
 }
@@ -319,14 +334,14 @@ void vduse_domain_reset_bounce_map(struct vduse_iova_domain *domain)
 	if (!domain->bounce_map)
 		return;
 
-	spin_lock(&domain->iotlb_lock);
+	spin_lock(&domain->iotlb.lock);
 	if (!domain->bounce_map)
 		goto unlock;
 
-	vduse_iotlb_del_range(domain, 0, domain->bounce_size - 1);
+	vduse_iotlb_del_range(&domain->iotlb, 0, domain->bounce_size - 1);
 	domain->bounce_map = 0;
 unlock:
-	spin_unlock(&domain->iotlb_lock);
+	spin_unlock(&domain->iotlb.lock);
 }
 
 static int vduse_domain_init_bounce_map(struct vduse_iova_domain *domain)
@@ -336,18 +351,18 @@ static int vduse_domain_init_bounce_map(struct vduse_iova_domain *domain)
 	if (domain->bounce_map)
 		return 0;
 
-	spin_lock(&domain->iotlb_lock);
+	spin_lock(&domain->iotlb.lock);
 	if (domain->bounce_map)
 		goto unlock;
 
-	ret = vduse_iotlb_add_range(domain, 0, domain->bounce_size - 1,
+	ret = vduse_iotlb_add_range(&domain->iotlb, 0, domain->bounce_size - 1,
 				    0, VHOST_MAP_RW, domain->file, 0);
 	if (ret)
 		goto unlock;
 
 	domain->bounce_map = 1;
 unlock:
-	spin_unlock(&domain->iotlb_lock);
+	spin_unlock(&domain->iotlb.lock);
 	return ret;
 }
 
@@ -433,14 +448,15 @@ void *vduse_domain_alloc_coherent(struct vduse_iova_domain *domain,
 	if (!iova || !orig)
 		goto err;
 
-	spin_lock(&domain->iotlb_lock);
-	if (vduse_iotlb_add_range(domain, (u64)iova, (u64)iova + size - 1,
+	spin_lock(&domain->iotlb.lock);
+	if (vduse_iotlb_add_range(&domain->iotlb, (u64)iova,
+				  (u64)iova + size - 1,
 				  virt_to_phys(orig), VHOST_MAP_RW,
 				  domain->file, (u64)iova)) {
-		spin_unlock(&domain->iotlb_lock);
+		spin_unlock(&domain->iotlb.lock);
 		goto err;
 	}
-	spin_unlock(&domain->iotlb_lock);
+	spin_unlock(&domain->iotlb.lock);
 
 	*dma_addr = iova;
 
@@ -464,19 +480,19 @@ void vduse_domain_free_coherent(struct vduse_iova_domain *domain, size_t size,
 	struct vdpa_map_file *map_file;
 	phys_addr_t pa;
 
-	spin_lock(&domain->iotlb_lock);
-	map = vhost_iotlb_itree_first(domain->iotlb, (u64)dma_addr,
+	spin_lock(&domain->iotlb.lock);
+	map = vhost_iotlb_itree_first(domain->iotlb.root, (u64)dma_addr,
 				      (u64)dma_addr + size - 1);
 	if (WARN_ON(!map)) {
-		spin_unlock(&domain->iotlb_lock);
+		spin_unlock(&domain->iotlb.lock);
 		return;
 	}
 	map_file = (struct vdpa_map_file *)map->opaque;
 	fput(map_file->file);
 	kfree(map_file);
 	pa = map->addr;
-	vhost_iotlb_map_free(domain->iotlb, map);
-	spin_unlock(&domain->iotlb_lock);
+	vhost_iotlb_map_free(domain->iotlb.root, map);
+	spin_unlock(&domain->iotlb.lock);
 
 	vduse_domain_free_iova(iovad, dma_addr, size);
 	free_pages_exact(phys_to_virt(pa), size);
@@ -523,14 +539,14 @@ static int vduse_domain_release(struct inode *inode, struct file *file)
 {
 	struct vduse_iova_domain *domain = file->private_data;
 
-	spin_lock(&domain->iotlb_lock);
-	vduse_iotlb_del_range(domain, 0, ULLONG_MAX);
+	spin_lock(&domain->iotlb.lock);
+	vduse_iotlb_del_range(&domain->iotlb, 0, ULLONG_MAX);
 	vduse_domain_remove_user_bounce_pages(domain);
 	vduse_domain_free_kernel_bounce_pages(domain);
-	spin_unlock(&domain->iotlb_lock);
+	spin_unlock(&domain->iotlb.lock);
 	put_iova_domain(&domain->stream_iovad);
 	put_iova_domain(&domain->consistent_iovad);
-	vhost_iotlb_free(domain->iotlb);
+	vduse_iotlb_deinit(&domain->iotlb);
 	vfree(domain->bounce_maps);
 	kfree(domain);
 
@@ -565,8 +581,7 @@ vduse_domain_create(unsigned long iova_limit, size_t bounce_size)
 	if (!domain)
 		return NULL;
 
-	domain->iotlb = vhost_iotlb_alloc(0, 0);
-	if (!domain->iotlb)
+	if (vduse_iotlb_init(&domain->iotlb))
 		goto err_iotlb;
 
 	domain->iova_limit = iova_limit;
@@ -587,7 +602,6 @@ vduse_domain_create(unsigned long iova_limit, size_t bounce_size)
 
 	domain->file = file;
 	rwlock_init(&domain->bounce_lock);
-	spin_lock_init(&domain->iotlb_lock);
 	init_iova_domain(&domain->stream_iovad,
 			PAGE_SIZE, IOVA_START_PFN);
 	ret = iova_domain_init_rcaches(&domain->stream_iovad);
@@ -607,7 +621,7 @@ err_iovad_stream:
 err_file:
 	vfree(domain->bounce_maps);
 err_map:
-	vhost_iotlb_free(domain->iotlb);
+	vduse_iotlb_deinit(&domain->iotlb);
 err_iotlb:
 	kfree(domain);
 	return NULL;

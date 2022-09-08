@@ -20,6 +20,11 @@
 
 #define INVALID_PHYS_ADDR (~(phys_addr_t)0)
 
+struct vduse_domain_iotlb {
+	struct vhost_iotlb *root;
+	spinlock_t lock;
+};
+
 struct vduse_bounce_map {
 	struct page *bounce_page;
 	u64 orig_phys;
@@ -32,8 +37,7 @@ struct vduse_iova_domain {
 	size_t bounce_size;
 	unsigned long iova_limit;
 	int bounce_map;
-	struct vhost_iotlb *iotlb;
-	spinlock_t iotlb_lock;
+	struct vduse_domain_iotlb iotlb;
 	struct file *file;
 	bool user_bounce_pages;
 	rwlock_t bounce_lock;

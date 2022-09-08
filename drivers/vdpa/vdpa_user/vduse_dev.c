@@ -1079,8 +1079,8 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 		if (entry.start > entry.last)
 			break;
 
-		spin_lock(&domain->iotlb_lock);
-		map = vhost_iotlb_itree_first(domain->iotlb,
+		spin_lock(&domain->iotlb.lock);
+		map = vhost_iotlb_itree_first(domain->iotlb.root,
 					      entry.start, entry.last);
 		if (map) {
 			map_file = (struct vdpa_map_file *)map->opaque;
@@ -1090,7 +1090,7 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 			entry.last = map->last;
 			entry.perm = map->perm;
 		}
-		spin_unlock(&domain->iotlb_lock);
+		spin_unlock(&domain->iotlb.lock);
 		ret = -EINVAL;
 		if (!f)
 			break;
@@ -1279,8 +1279,8 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 				 sizeof(info.reserved)))
 			break;
 
-		spin_lock(&domain->iotlb_lock);
-		map = vhost_iotlb_itree_first(domain->iotlb,
+		spin_lock(&domain->iotlb.lock);
+		map = vhost_iotlb_itree_first(domain->iotlb.root,
 					      info.start, info.last);
 		if (map) {
 			info.start = map->start;
@@ -1290,7 +1290,7 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 			    map->last == domain->bounce_size - 1)
 				info.capability |= VDUSE_IOVA_CAP_UMEM;
 		}
-		spin_unlock(&domain->iotlb_lock);
+		spin_unlock(&domain->iotlb.lock);
 		if (!map)
 			break;
 
