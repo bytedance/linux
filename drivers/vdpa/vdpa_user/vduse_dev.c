@@ -426,6 +426,9 @@ static void vduse_dev_reset(struct vduse_dev *dev)
 	if (domain->bounce_map)
 		vduse_domain_reset_bounce_map(domain);
 
+	if (domain->zc_map)
+		vduse_domain_reset_zc_map(domain);
+
 	down_write(&dev->rwsem);
 
 	dev->status = 0;
@@ -1288,6 +1291,12 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 			info.capability = 0;
 			if (vduse_domain_is_bounce_map(domain, map))
 				info.capability |= VDUSE_IOVA_CAP_UMEM;
+
+			if (vduse_domain_is_zc_map(domain, map)) {
+				info.capability |= VDUSE_IOVA_CAP_ZERO_COPY;
+				info.addr_mask = PHYS_ADDR_MASK;
+			}
+
 		}
 		spin_unlock(&domain->iotlb.lock);
 		if (!map)
@@ -1618,6 +1627,10 @@ static bool vduse_validate_config(struct vduse_dev_config *config)
 			 sizeof(config->reserved)))
 		return false;
 
+	if (!is_mem_zero((const char *)config->reserved2,
+			 sizeof(config->reserved2)))
+		return false;
+
 	if (config->vq_align > PAGE_SIZE)
 		return false;
 
@@ -1688,7 +1701,8 @@ static int vduse_create_dev(struct vduse_dev_config *config,
 		goto err_str;
 
 	dev->domain = vduse_domain_create(VDUSE_IOVA_SIZE - 1,
-					  VDUSE_BOUNCE_SIZE, false);
+					  VDUSE_BOUNCE_SIZE,
+					  config->enable_zc);
 	if (!dev->domain)
 		goto err_domain;
 
