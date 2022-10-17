@@ -45,7 +45,8 @@ struct vduse_dev_config {
 	__u32 vq_align;
 	__u8 enable_zc;
 	__u8 reserved2[3];
-	__u32 reserved[12];
+	__u32 zc_size;
+	__u32 reserved[11];
 	__u32 config_size;
 	__u8 config[];
 };

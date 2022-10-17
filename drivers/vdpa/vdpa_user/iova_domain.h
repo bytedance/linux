@@ -45,6 +45,7 @@ struct vduse_iova_domain {
 	struct file *file;
 	bool user_bounce_pages;
 	bool enable_zc;
+	unsigned long zc_size;
 	rwlock_t bounce_lock;
 };
 
@@ -90,7 +91,8 @@ void vduse_domain_destroy(struct vduse_iova_domain *domain);
 
 struct vduse_iova_domain *vduse_domain_create(unsigned long iova_limit,
 					      size_t bounce_size,
-					      bool enable_zc);
+					      bool enable_zc,
+					      unsigned long zc_size);
 
 int vduse_domain_init(void);
 

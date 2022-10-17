@@ -659,7 +659,7 @@ dma_addr_t vduse_domain_map_page(struct vduse_iova_domain *domain,
 				 size_t size, enum dma_data_direction dir,
 				 unsigned long attrs)
 {
-	if (domain->enable_zc)
+	if (domain->enable_zc && size >= domain->zc_size)
 		return vduse_domain_map_page_zc(domain, page, offset,
 						size, dir, attrs);
 
@@ -672,7 +672,7 @@ void vduse_domain_unmap_page(struct vduse_iova_domain *domain,
 			     enum dma_data_direction dir,
 			     unsigned long attrs)
 {
-	if (domain->enable_zc)
+	if (domain->enable_zc && size >= domain->zc_size)
 		return vduse_domain_unmap_page_zc(domain, dma_addr,
 						  size, dir, attrs);
 
@@ -812,7 +812,7 @@ void vduse_domain_destroy(struct vduse_iova_domain *domain)
 
 struct vduse_iova_domain *
 vduse_domain_create(unsigned long iova_limit, size_t bounce_size,
-		    bool enable_zc)
+		    bool enable_zc, unsigned long zc_size)
 {
 	struct vduse_iova_domain *domain;
 	struct file *file;
@@ -838,6 +838,7 @@ vduse_domain_create(unsigned long iova_limit, size_t bounce_size,
 		goto err_iotlb_zc;
 
 	domain->enable_zc = enable_zc;
+	domain->zc_size = zc_size;
 	domain->iova_limit = iova_limit;
 	domain->bounce_size = PAGE_ALIGN(bounce_size);
 	domain->bounce_maps = vzalloc(bounce_pfns *

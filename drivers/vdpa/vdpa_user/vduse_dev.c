@@ -1702,7 +1702,8 @@ static int vduse_create_dev(struct vduse_dev_config *config,
 
 	dev->domain = vduse_domain_create(VDUSE_IOVA_SIZE - 1,
 					  VDUSE_BOUNCE_SIZE,
-					  config->enable_zc);
+					  config->enable_zc,
+					  config->zc_size);
 	if (!dev->domain)
 		goto err_domain;
 
